@@ -35,14 +35,27 @@ else:
 # =========================
 # DATA LOADING & CLEANING
 # =========================
+
+
 @st.cache_data(ttl=600)
 def load_data():
-    df = pd.read_csv("data/master_dataset.csv", low_memory=False)
+    BASE_DIR = Path(__file__).parent
+    DATA_PATH = BASE_DIR / "data" / "master_dataset.csv"
+
+    if not DATA_PATH.exists():
+        st.error(f"Dataset not found at {DATA_PATH}")
+        st.stop()
+
+    df = pd.read_csv(DATA_PATH, low_memory=False)
 
     # Standardize column names
-    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
 
-    # Rename required columns explicitly
     rename_map = {
         "region": "region",
         "country": "country",
@@ -53,14 +66,12 @@ def load_data():
 
     df = df.rename(columns=rename_map)
 
-    # Keep only valid rows
     df = df.dropna(subset=["country", "dqi"])
-
-    # Ensure numeric DQI
     df["dqi"] = pd.to_numeric(df["dqi"], errors="coerce")
     df = df.dropna(subset=["dqi"])
 
     return df
+
 
 # Load full dataset
 df_full = load_data()
