@@ -1,4 +1,3 @@
-```markdown
 # Clinical Dashboard - Novartis 2025
 
 A Streamlit-based clinical data visualization and analysis dashboard for pharmaceutical research and clinical trial monitoring.
