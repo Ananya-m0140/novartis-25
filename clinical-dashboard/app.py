@@ -214,7 +214,7 @@ fig_map.update_layout(
 
 
 
-st.plotly_chart(fig_map, use_container_width=True)
+st.plotly_chart(fig_map, width='stretch')
 
 # =========================
 #  CRITICAL SITES TABLE
@@ -254,7 +254,7 @@ if site_df.shape[0] > 1:
         color_continuous_scale="Viridis"
     )
     fig_bar.update_layout(template="plotly_dark", height=420)
-    st.plotly_chart(fig_bar, use_container_width=True)
+    st.plotly_chart(fig_bar, width='stretch')
 
 # =========================
 #  DRILL-DOWN TABLE
