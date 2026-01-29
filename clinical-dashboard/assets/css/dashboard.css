@@ -1,0 +1,35 @@
+.stApp {
+    background: linear-gradient(135deg, #0d0d0f, #1b1b24, #262637);
+    color: #E5E5E5 !important;
+}
+
+[data-testid="stSidebar"] {
+    background: #111218 !important;
+}
+
+/* fix sidebar text visibility for selectboxes, sliders, labels */
+[data-testid="stSidebar"] * {
+    color: #ffffff !important;   /* white text for visibility on dark sidebar */
+}
+
+/* Make the dropdown text and slider labels more readable */
+.css-1n76uvr, .css-1emrehy, .css-1lcbmhc {
+    color: #ffffff !important;
+}
+
+.kpi-card {
+    background: rgba(255,255,255,0.06);
+    border-radius: 18px;
+    padding: 20px;
+    backdrop-filter: blur(8px);
+}
+/* AI Tools buttons styling */
+.ai-button button {
+    color: black;             /* Text color */
+    font-size: 22px;          /* Larger font */
+    font-weight: bold;        
+    background-color: #f0f0f0; /* Light gray background */
+    padding: 15px 25px;       /* Increase button size */
+    border-radius: 12px;      /* Rounded corners */
+    border: 2px solid #ccc;   /* Optional border */
+}
