@@ -18,9 +18,19 @@ st.set_page_config(
 # =========================
 # LOAD CSS
 # =========================
-with open("./assets/css/dashboard.css") as f:
-    st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
-    
+# =========================
+# LOAD CSS (SAFE PATH)
+# =========================
+from pathlib import Path
+
+CSS_PATH = Path(__file__).parent / "assets" / "css" / "dashboard.css"
+
+if CSS_PATH.exists():
+    with open(CSS_PATH) as f:
+        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+else:
+    st.error(f"CSS file not found: {CSS_PATH}")
+
 
 # =========================
 # DATA LOADING & CLEANING
