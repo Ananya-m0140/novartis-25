@@ -18,7 +18,7 @@ st.set_page_config(
 # =========================
 # LOAD CSS
 # =========================
-with open("assets/css/dashboard.css") as f:
+with open("./assets/css/dashboard.css") as f:
     st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
     
 
