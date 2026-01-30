@@ -104,12 +104,12 @@ patient_sel = st.sidebar.selectbox(
 
 critical_threshold = st.sidebar.slider(
     "⚠️ Critical DQI Alert Threshold",
-    0, 100, 60
+    0, 100, 40
 )
 
 high_perf_threshold = st.sidebar.slider(
     "🌟 High Performing DQI Threshold",
-    0, 100, 85
+    0, 100, 50
 )
 
 # =========================
