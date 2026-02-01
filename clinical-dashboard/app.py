@@ -31,7 +31,10 @@ st.markdown("""
         background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
     }
             
-    
+    /* Hide Streamlit multipage navigation */
+        section[data-testid="stSidebar"] div[data-testid="stSidebarNav"] {
+            display: none;
+        }
     /* Hide Streamlit default elements */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
@@ -1012,7 +1015,7 @@ with col4:
 # =========================
 # ISSUE ANALYSIS SECTION - UPDATED WITH QUERIES DATASET
 # =========================
-st.markdown("## 🔍 Issue Analysis")
+st.markdown("##🔍 Issue Analysis")
 
 tab1, tab2, tab3, tab4 = st.tabs(["Missing Data", "Query Analysis", "Protocol Deviations", "Query Resolution Time"])
 
@@ -1447,11 +1450,13 @@ with col1:
     
     readiness_level = "✅ Ready" if readiness_score > 80 else "⚠️ Needs Work" if readiness_score > 60 else "❌ Not Ready"
     readiness_color = "#38a169" if readiness_score > 80 else "#d69e2e" if readiness_score > 60 else "#e53e3e"
+    display_score = readiness_score-100
+
     
     st.markdown(f"""
     <div style="text-align: center; padding: 20px;">
         <div style="font-size: 3rem; font-weight: 800; color: {readiness_color}; margin-bottom: 10px;">
-            {readiness_score:.1f}%
+            {display_score:.1f}%
         </div>
         <div style="font-size: 1.2rem; color: #4a5568; margin-bottom: 20px;">
             {readiness_level}
