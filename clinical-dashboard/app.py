@@ -7,7 +7,6 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from textwrap import dedent
 
-
 from ai.generate_summary import generate_site_summary
 from ai.agent_recommender import generate_agent_recommendations
 from ai.nlq_chat import nlq_interface
@@ -429,11 +428,13 @@ st.markdown("""
 def load_data():
     BASE_DIR = Path(__file__).parent
     DATA_PATH = BASE_DIR / "data" / "master_dataset.csv"
-
+    QUERIES_PATH = BASE_DIR / "data" / "queries.csv"
+    
+    # Load main dataset
     if not DATA_PATH.exists():
         st.error(f"Dataset not found at {DATA_PATH}")
         st.stop()
-
+    
     df = pd.read_csv(DATA_PATH, low_memory=False)
 
     # Standardize column names
@@ -509,33 +510,116 @@ def load_data():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    return df
+    # Load queries dataset
+    queries_df = None
+    if QUERIES_PATH.exists():
+        try:
+            queries_df = pd.read_csv(QUERIES_PATH)
+            
+            # Clean column names
+            queries_df.columns = queries_df.columns.str.strip()
+            
+            # Rename columns for consistency
+            queries_rename_map = {
+                'Subject Name': 'subject_name',
+                'Open Queries': 'open_queries',
+                'Closed Queries': 'closed_queries',
+                'Average Query Close Duration (Days)': 'avg_resolution_days'
+            }
+            
+            for old_col, new_col in queries_rename_map.items():
+                if old_col in queries_df.columns:
+                    queries_df = queries_df.rename(columns={old_col: new_col})
+            
+            # Convert to numeric
+            if 'open_queries' in queries_df.columns:
+                queries_df['open_queries'] = pd.to_numeric(queries_df['open_queries'], errors='coerce')
+            if 'closed_queries' in queries_df.columns:
+                queries_df['closed_queries'] = pd.to_numeric(queries_df['closed_queries'], errors='coerce')
+            if 'avg_resolution_days' in queries_df.columns:
+                queries_df['avg_resolution_days'] = pd.to_numeric(queries_df['avg_resolution_days'], errors='coerce')
+            
+            print(f"Loaded queries dataset with {len(queries_df)} subjects")
+            print(f"Total open queries: {queries_df['open_queries'].sum()}")
+            print(f"Total closed queries: {queries_df['closed_queries'].sum()}")
+            
+        except Exception as e:
+            st.warning(f"Could not load queries.csv: {e}")
+            queries_df = None
+    else:
+        st.warning(f"Queries dataset not found at {QUERIES_PATH}")
+    
+    return df, queries_df
 
 # =========================
 # CALCULATION FUNCTIONS
 # =========================
-def calculate_metrics(df):
+def calculate_metrics(df, queries_df):
     """Calculate all derived metrics"""
     
     # Patient Clean Status
     df['clean_patient'] = (
-        (df['missing_visits'].fillna(0) == 0) &
-        (df['missing_pages'].fillna(0) == 0) &
-        (df['total_queries'].fillna(0) == 0) &
-        (df['crfs_require_sdv'].fillna(0) == 0) &
-        (df['crfs_signed'].fillna(0) > 0) &
-        (df['broken_signatures'].fillna(0) == 0)
-    ).astype(int)
+    # Completeness
+    (df['missing_visits'].fillna(0) == 0) &
+    (df['missing_pages'].fillna(0) == 0) &
+    
+    # Verification: nothing pending
+    (df['crfs_require_sdv'].fillna(0) == 0) &
+    
+    # Signatures: nothing missing or broken
+    (df['crfs_never_signed'].fillna(0) == 0) &
+    (df['broken_signatures'].fillna(0) == 0) 
+    
+    
+).astype(int)
+
     
     # Percentages
-    df['missing_visits_pct'] = (df['missing_visits'].fillna(0) / df['expected_visits'].replace(0, 1)) * 100
-    df['missing_pages_pct'] = (df['missing_pages'].fillna(0) / df['pages_entered'].replace(0, 1)) * 100
+    df['missing_visits_pct'] = (df['missing_visits'].fillna(0) / df['expected_visits']) * 100
+    df['missing_pages_pct'] = (df['missing_pages'].fillna(0) / df['pages_entered']) * 100
     df['non_conformant_pct'] = (df['non_conformant_pages'].fillna(0) / df['pages_entered'].replace(0, 1)) * 100
-    df['verification_pct'] = (df['forms_verified'].fillna(0) / df['crfs_require_sdv'].replace(0, 1)) * 100
+    total_verified = df['forms_verified'].sum()
+    total_sdv_population = (
+    df['forms_verified'] + df['crfs_require_sdv']
+    ).sum()
+
+    verification_pct = (
+    total_verified / total_sdv_population * 100
+    if total_sdv_population > 0 else np.nan
+)
+    df['verification_pct'] = verification_pct
+
+
     df['signature_pct'] = (df['crfs_signed'].fillna(0) / (df['crfs_signed'] + df['crfs_never_signed']).replace(0, 1)) * 100
     
-    # Query resolution rate (assuming some queries are resolved)
-    df['query_resolution_rate'] = 100 - (df['total_queries'].fillna(0) / (df['total_queries'] + 10).replace(0, 1)) * 100
+    # Query metrics from queries dataset
+    if queries_df is not None and 'open_queries' in queries_df.columns and 'closed_queries' in queries_df.columns:
+        # Calculate query statistics from queries dataset
+        total_open_queries = queries_df['open_queries'].sum()
+        total_closed_queries = queries_df['closed_queries'].sum()
+        total_queries = total_open_queries + total_closed_queries
+        
+        # Query resolution rate
+        query_resolution_rate = (total_closed_queries / total_queries * 100) if total_queries > 0 else 0
+        
+        # Average resolution time
+        avg_resolution_days = queries_df['avg_resolution_days'].mean() if 'avg_resolution_days' in queries_df.columns else 0
+        
+        # Add to df for consistency (these will be used in visualizations)
+        df['total_queries_from_csv'] = total_queries
+        df['open_queries_from_csv'] = total_open_queries
+        df['closed_queries_from_csv'] = total_closed_queries
+        df['query_resolution_rate'] = query_resolution_rate
+        df['avg_resolution_days'] = avg_resolution_days
+        
+        # Calculate query-related percentages per site (if patient_id can be mapped to site_id)
+        # For now, we'll add these as global metrics
+        print(f"Query metrics: Open={total_open_queries}, Closed={total_closed_queries}, Rate={query_resolution_rate:.1f}%, Avg Days={avg_resolution_days:.1f}")
+    else:
+        # Fallback to original calculation if queries dataset not available
+        total_queries = df['total_queries'].sum()
+        df['query_resolution_rate'] = 100 - (df['total_queries'].fillna(0) / (df['total_queries'] + 10).replace(0, 1)) * 100
+        df['avg_resolution_days'] = 0  # Not available in original dataset
     
     # Data readiness score (composite)
     df['data_readiness_score'] = (
@@ -546,7 +630,7 @@ def calculate_metrics(df):
         df['signature_pct'].fillna(0) * 0.15
     )
     
-    return df
+    return df, queries_df
 
 # =========================
 # VISUALIZATION FUNCTIONS
@@ -609,12 +693,70 @@ def create_heatmap(df, metric_col, title):
     
     return fig
 
+def create_query_visualizations(queries_df):
+    """Create visualizations from queries dataset"""
+    if queries_df is None or queries_df.empty:
+        return None, None, None
+    
+    # 1. Query Status Distribution
+    total_open = queries_df['open_queries'].sum() if 'open_queries' in queries_df.columns else 0
+    total_closed = queries_df['closed_queries'].sum() if 'closed_queries' in queries_df.columns else 0
+    
+    status_data = pd.DataFrame({
+        'Status': ['Open', 'Closed'],
+        'Count': [total_open, total_closed]
+    })
+    
+    fig_status = px.pie(
+        status_data,
+        names='Status',
+        values='Count',
+        title='Query Status Distribution',
+        color='Status',
+        color_discrete_map={'Open': '#e53e3e', 'Closed': '#38a169'},
+        hole=0.4
+    )
+    
+    # 2. Top Subjects with Open Queries
+    if 'subject_name' in queries_df.columns and 'open_queries' in queries_df.columns:
+        top_open = queries_df.nlargest(10, 'open_queries')[['subject_name', 'open_queries']]
+        fig_top_open = px.bar(
+            top_open,
+            x='subject_name',
+            y='open_queries',
+            title='Top 10 Subjects with Open Queries',
+            labels={'subject_name': 'Subject', 'open_queries': 'Open Queries'},
+            color='open_queries',
+            color_continuous_scale='Reds'
+        )
+    else:
+        fig_top_open = None
+    
+    # 3. Resolution Time Distribution
+    if 'avg_resolution_days' in queries_df.columns:
+        resolution_data = queries_df[queries_df['avg_resolution_days'].notna()]
+        if not resolution_data.empty:
+            fig_resolution = px.histogram(
+                resolution_data,
+                x='avg_resolution_days',
+                title='Query Resolution Time Distribution',
+                labels={'avg_resolution_days': 'Resolution Time (Days)'},
+                nbins=20
+            )
+        else:
+            fig_resolution = None
+    else:
+        fig_resolution = None
+    
+    return fig_status, fig_top_open, fig_resolution
+
 # =========================
 # LOAD DATA
 # =========================
-df_full = load_data()
-df_full = calculate_metrics(df_full)
+df_full, queries_df_full = load_data()
+df_full, queries_df_full = calculate_metrics(df_full, queries_df_full)
 df = df_full.copy()
+queries_df = queries_df_full.copy()
 
 # =========================
 # SIDEBAR FILTERS
@@ -699,6 +841,19 @@ total_patients = df['patient_id'].nunique()
 clean_patients = df['clean_patient'].sum() if 'clean_patient' in df.columns else 0
 clean_patient_pct = (clean_patients / total_patients * 100) if total_patients > 0 else 0
 
+# Get query metrics from queries dataset
+if queries_df is not None:
+    total_open_queries = queries_df['open_queries'].sum() if 'open_queries' in queries_df.columns else 0
+    total_closed_queries = queries_df['closed_queries'].sum() if 'closed_queries' in queries_df.columns else 0
+    total_queries = total_open_queries + total_closed_queries
+    query_resolution_rate = (total_closed_queries / total_queries * 100) if total_queries > 0 else 0
+    avg_resolution_days = queries_df['avg_resolution_days'].mean() if 'avg_resolution_days' in queries_df.columns else 0
+else:
+    total_queries = 0
+    total_open_queries = 0
+    query_resolution_rate = 0
+    avg_resolution_days = 0
+
 col1.markdown(
     f"""<div class='kpi-card'>
         <h3>Sites</h3>
@@ -740,509 +895,25 @@ col4.markdown(
 col5.markdown(
     f"""<div class='kpi-card'>
         <h3>Open Queries</h3>
-        <h2>{df['total_queries'].sum():,}</h2>
+        <h2>{total_open_queries:,}</h2>
+        <div class='trend {"down" if total_open_queries > 0 else "up"}'>
+            {total_closed_queries:,} closed
+        </div>
     </div>""",
     unsafe_allow_html=True
 )
 
 col6.markdown(
     f"""<div class='kpi-card'>
-        <h3>Clean CRF %</h3>
-        <h2>{df['clean_crf_percent'].mean():.1f}%</h2>
+        <h3>Query Resolution</h3>
+        <h2>{query_resolution_rate:.1f}%</h2>
+        <div class='trend {"up" if avg_resolution_days < 10 else "down"}'>
+            Avg {avg_resolution_days:.1f} days
+        </div>
     </div>""",
     unsafe_allow_html=True
 )
 
-# =========================
-# DATA QUALITY METRICS SECTION
-# =========================
-st.markdown("##  Data Quality Metrics")
-
-# Row 1: Gauge Charts
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.plotly_chart(create_gauge_chart(
-        df['clean_crf_percent'].mean(),
-        "Clean CRF %"
-    ), use_container_width=True)
-
-with col2:
-    st.plotly_chart(create_gauge_chart(
-        df['query_resolution_rate'].mean() if 'query_resolution_rate' in df.columns else 0,
-        "Query Resolution %"
-    ), use_container_width=True)
-
-with col3:
-    st.plotly_chart(create_gauge_chart(
-        100 - df['missing_visits_pct'].mean(),
-        "Visit Completeness %"
-    ), use_container_width=True)
-
-with col4:
-    st.plotly_chart(create_gauge_chart(
-        df['verification_pct'].mean(),
-        "Verification %"
-    ), use_container_width=True)
-
-# =========================
-# ISSUE ANALYSIS SECTION
-# =========================
-st.markdown("## 🔍 Issue Analysis")
-
-tab1, tab2, tab3 = st.tabs(["Missing Data", "Query Analysis", "Protocol Deviations"])
-
-with tab1:
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown(dedent("""
-        <div class="chart-container">
-            <h3> Sites with Most Missing Visits</h3>
-        """), unsafe_allow_html=True)
-
-        missing_visits_by_site = (
-            df.groupby('site_id')['missing_visits']
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-        )
-
-        fig = px.bar(
-            x=missing_visits_by_site.index,
-            y=missing_visits_by_site.values,
-            labels={'x': 'Site ID', 'y': 'Missing Visits'},
-            color=missing_visits_by_site.values,
-            color_continuous_scale='Reds'
-        )
-        fig.update_layout(showlegend=False, height=300)
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col2:
-        st.markdown(dedent("""
-        <div class="chart-container">
-            <h3> Sites with Most Missing Pages</h3>
-        """), unsafe_allow_html=True)
-
-        missing_pages_by_site = (
-            df.groupby('site_id')['missing_pages']
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-        )
-
-        fig = px.bar(
-            x=missing_pages_by_site.index,
-            y=missing_pages_by_site.values,
-            labels={'x': 'Site ID', 'y': 'Missing Pages'},
-            color=missing_pages_by_site.values,
-            color_continuous_scale='Oranges'
-        )
-        fig.update_layout(showlegend=False, height=300)
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-with tab2:
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown(dedent("""
-        <div class="chart-container">
-            <h3> Query Types Distribution</h3>
-        """), unsafe_allow_html=True)
-
-        query_types = {
-            'DM Queries': df['dm_queries'].sum(),
-            'Clinical Queries': df['clinical_queries'].sum(),
-            'Medical Queries': df['medical_queries'].sum(),
-            'Site Queries': df['site_queries'].sum(),
-            'Safety Queries': df['safety_queries'].sum()
-        }
-        query_df = pd.DataFrame(list(query_types.items()), columns=['Query Type', 'Count'])
-
-        fig = px.pie(
-            query_df,
-            names='Query Type',
-            values='Count',
-            hole=0.4
-        )
-        fig.update_layout(height=350)
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col2:
-        st.markdown(dedent("""
-        <div class="chart-container">
-            <h3> Sites with Most Open Queries</h3>
-        """), unsafe_allow_html=True)
-
-        queries_by_site = (
-            df.groupby('site_id')['total_queries']
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-        )
-
-        fig = px.bar(
-            x=queries_by_site.index,
-            y=queries_by_site.values,
-            labels={'x': 'Site ID', 'y': 'Open Queries'},
-            color=queries_by_site.values,
-            color_continuous_scale='Purples'
-        )
-        fig.update_layout(showlegend=False, height=300)
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-with tab3:
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown(dedent("""
-        <div class="chart-container">
-            <h3>⚠️ Protocol Deviations by Site</h3>
-        """), unsafe_allow_html=True)
-
-        pds_by_site = (
-            df.groupby('site_id')['pds_confirmed']
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-        )
-
-        fig = px.bar(
-            x=pds_by_site.index,
-            y=pds_by_site.values,
-            labels={'x': 'Site ID', 'y': 'Confirmed PDs'},
-            color=pds_by_site.values,
-            color_continuous_scale='Reds'
-        )
-        fig.update_layout(showlegend=False, height=300)
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-
-# =========================
-# SITE PERFORMANCE HEATMAPS
-# =========================
-st.markdown("##  Site Performance Heatmaps")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-    st.markdown("###  Clean CRF Percentage by Site")
-    st.plotly_chart(create_heatmap(df, 'clean_crf_percent', ''), use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with col2:
-    st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-    st.markdown("### ✅ Data Readiness Score by Site")
-    st.plotly_chart(create_heatmap(df, 'data_readiness_score', ''), use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-# =========================
-# CRITICAL ALERTS SECTION
-# =========================
-st.markdown("##  Critical Alerts & Immediate Attention")
-
-# Calculate critical metrics
-site_summary = df.groupby('site_id').agg({
-    'dqi': 'mean',
-    'total_queries': 'sum',
-    'missing_visits': 'sum',
-    'missing_pages': 'sum',
-    'pds_confirmed': 'sum',
-    'clean_patient': 'sum',
-    'patient_id': 'nunique'
-}).reset_index()
-
-site_summary['clean_patient_pct'] = (site_summary['clean_patient'] / site_summary['patient_id']) * 100
-
-# Create a better priority score
-def calculate_priority_score(row):
-    score = 0
-    
-    # DQI score (0-100, lower is worse)
-    if row['dqi'] < 20: score += 40
-    elif row['dqi'] < 40: score += 30
-    elif row['dqi'] < 60: score += 20
-    
-    # Clean patient percentage
-    if pd.notna(row['clean_patient_pct']):
-        if row['clean_patient_pct'] < 20: score += 30
-        elif row['clean_patient_pct'] < 50: score += 20
-        elif row['clean_patient_pct'] < 80: score += 10
-    
-    # Open queries
-    if pd.notna(row['total_queries']):
-        if row['total_queries'] > 50: score += 20
-        elif row['total_queries'] > 20: score += 15
-        elif row['total_queries'] > 5: score += 10
-    
-    # Missing visits
-    if pd.notna(row['missing_visits']):
-        if row['missing_visits'] > 20: score += 10
-    
-    return score
-
-site_summary['priority_score'] = site_summary.apply(calculate_priority_score, axis=1)
-
-# Categorize priority
-def categorize_priority(score):
-    if score >= 60:
-        return "🔴 Critical", "#feb2b2"
-    elif score >= 40:
-        return "🟠 High", "#fbd38d"
-    elif score >= 20:
-        return "🟡 Medium", "#fefcbf"
-    else:
-        return "🟢 Low", "#c6f6d5"
-
-site_summary['priority_info'] = site_summary['priority_score'].apply(
-    lambda x: categorize_priority(x)
-)
-site_summary['priority'] = site_summary['priority_info'].apply(lambda x: x[0])
-site_summary['priority_color'] = site_summary['priority_info'].apply(lambda x: x[1])
-
-# Determine DQI status
-site_summary['dqi_status'] = site_summary['dqi'].apply(
-    lambda x: ("🔴 Critical", "#e53e3e") if x < 40 else 
-              ("🟠 Warning", "#d69e2e") if x < 60 else 
-              ("🟢 Good", "#38a169")
-)
-site_summary['dqi_status_text'] = site_summary['dqi_status'].apply(lambda x: x[0])
-site_summary['dqi_color'] = site_summary['dqi_status'].apply(lambda x: x[1])
-
-# Top 10 sites needing attention
-critical_sites = site_summary.sort_values(
-    ['priority_score', 'dqi', 'total_queries', 'missing_visits'], 
-    ascending=[False, True, False, False]
-).head(10)
-
-# Create a clean DataFrame for display with consistent column names
-display_df = critical_sites[['site_id', 'dqi', 'total_queries', 'missing_visits', 'clean_patient_pct', 'priority']].copy()
-display_df.columns = ['Site_ID', 'DQI', 'Open_Queries', 'Missing_Visits', 'Clean_Patients_Pct', 'Priority']
-
-# Apply styling with corrected column names
-def style_row(row):
-    # Get DQI color
-    if row['DQI'] < 40:
-        dqi_color = "#e53e3e"
-    elif row['DQI'] < 60:
-        dqi_color = "#d69e2e"
-    else:
-        dqi_color = "#38a169"
-    
-    # Get priority color
-    if "Critical" in str(row['Priority']):
-        priority_color = "#feb2b2"
-    elif "High" in str(row['Priority']):
-        priority_color = "#fbd38d"
-    elif "Medium" in str(row['Priority']):
-        priority_color = "#fefcbf"
-    else:
-        priority_color = "#c6f6d5"
-    
-    # Format values
-    clean_pct = f"{row['Clean_Patients_Pct']:.1f}%" if pd.notna(row['Clean_Patients_Pct']) else "N/A"
-    queries = int(row['Open_Queries']) if pd.notna(row['Open_Queries']) else 0
-    missing_visits = int(row['Missing_Visits']) if pd.notna(row['Missing_Visits']) else 0
-    dqi_value = f"{row['DQI']:.1f}" if pd.notna(row['DQI']) else "N/A"
-    
-    return [
-        f"<strong>{row['Site_ID']}</strong>",
-        f"<span style='color: {dqi_color}; font-weight: bold;'>{dqi_value}</span>",
-        "🔴 Critical" if row['DQI'] < 40 else "🟠 Warning" if row['DQI'] < 60 else "🟢 Good",
-        f"{queries}",
-        f"{missing_visits}",
-        f"{clean_pct}",
-        f"<div style='background-color: {priority_color}; padding: 5px 10px; border-radius: 4px; font-weight: bold; text-align: center;'>{row['Priority']}</div>"
-    ]
-
-# Create styled rows
-styled_rows = [style_row(row) for _, row in display_df.iterrows()]
-styled_df = pd.DataFrame(styled_rows, columns=['Site ID', 'DQI Score', 'Status', 'Open Queries', 'Missing Visits', 'Clean Patients %', 'Priority'])
-
-# Display using Streamlit's dataframe with HTML
-
-
-# Alternative: Use a simpler approach with Streamlit's native components
-st.markdown('<div class="content-card">', unsafe_allow_html=True)
-st.markdown("### ⚠️ Sites Requiring Attention (Alternative View)")
-
-# Create a simpler table view
-for _, site in critical_sites.head(5).iterrows():
-    col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
-    
-    with col1:
-        st.metric(
-            label=f"Site {site['site_id']}",
-            value=f"DQI: {site['dqi']:.1f}",
-            delta="Critical" if site['dqi'] < 40 else "Warning" if site['dqi'] < 60 else "Good",
-            delta_color="inverse"
-        )
-    
-    with col2:
-        clean_pct = f"{site['clean_patient_pct']:.1f}%" if pd.notna(site['clean_patient_pct']) else "N/A"
-        st.metric(
-            label="Clean Patients",
-            value=clean_pct,
-            delta_color="off"
-        )
-    
-    with col3:
-        st.metric(
-            label="Open Queries",
-            value=int(site['total_queries']) if pd.notna(site['total_queries']) else 0,
-            delta_color="off"
-        )
-    
-    with col4:
-        # Create a colored priority badge
-        priority_text, priority_color = categorize_priority(site['priority_score'])
-        st.markdown(f"""
-        <div style='background-color: {priority_color}; 
-                    padding: 10px; 
-                    border-radius: 8px; 
-                    text-align: center;
-                    font-weight: bold;
-                    color: #2d3748;'>
-            {priority_text}
-        </div>
-        """, unsafe_allow_html=True)
-
-st.markdown('</div>', unsafe_allow_html=True)
-   
-# =========================
-# DATA READINESS FOR ANALYSIS
-# =========================
-st.markdown("##  Data Readiness for Statistical Analysis")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-    st.markdown("### 🔬 Interim Analysis Readiness")
-    
-    # Calculate readiness score with error handling
-    try:
-        readiness_score = (
-            (df['clean_crf_percent'].mean() * 0.3) +
-            (100 - df['missing_visits_pct'].mean() * 0.2) +
-            (df['verification_pct'].mean() * 0.2) +
-            (df['signature_pct'].mean() * 0.15) +
-            (df['query_resolution_rate'].mean() * 0.15)
-        )
-    except:
-        readiness_score = 0
-    
-    readiness_level = "✅ Ready" if readiness_score > 80 else "⚠️ Needs Work" if readiness_score > 60 else "❌ Not Ready"
-    readiness_color = "#38a169" if readiness_score > 80 else "#d69e2e" if readiness_score > 60 else "#e53e3e"
-    
-    st.markdown(f"""
-    <div style="text-align: center; padding: 20px;">
-        <div style="font-size: 3rem; font-weight: 800; color: {readiness_color}; margin-bottom: 10px;">
-            {readiness_score:.1f}%
-        </div>
-        <div style="font-size: 1.2rem; color: #4a5568; margin-bottom: 20px;">
-            {readiness_level}
-        </div>
-        <div style="font-size: 0.9rem; color: #718096;">
-            Based on CRF cleanliness, verification, and query resolution
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with col2:
-    st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-    st.markdown("###  Submission Readiness Checklist")
-    
-    # Define checklist with error handling
-    checklist_items = []
-    
-    # Check each condition with try-except
-    try:
-        checklist_items.append(("CRF Cleanliness > 85%", df['clean_crf_percent'].mean() > 85))
-    except:
-        checklist_items.append(("CRF Cleanliness > 85%", False))
-    
-    try:
-        checklist_items.append(("Missing Visits < 5%", df['missing_visits_pct'].mean() < 5))
-    except:
-        checklist_items.append(("Missing Visits < 5%", False))
-    
-    try:
-        checklist_items.append(("Verification > 90%", df['verification_pct'].mean() > 90))
-    except:
-        checklist_items.append(("Verification > 90%", False))
-    
-    try:
-        checklist_items.append(("Signatures > 95%", df['signature_pct'].mean() > 95))
-    except:
-        checklist_items.append(("Signatures > 95%", False))
-    
-    try:
-        checklist_items.append(("Query Resolution > 80%", df['query_resolution_rate'].mean() > 80))
-    except:
-        checklist_items.append(("Query Resolution > 80%", False))
-    
-    try:
-        checklist_items.append(("PDs Resolved", df['pds_confirmed'].mean() > 0))
-    except:
-        checklist_items.append(("PDs Resolved", False))
-    
-    checklist_html = ""
-    for item, status in checklist_items:
-        icon = "✅" if status else "❌"
-        color = "#38a169" if status else "#e53e3e"
-        checklist_html += f"""
-        <div style="display: flex; align-items: center; margin-bottom: 10px; padding: 8px; background-color: {'#f0fff4' if status else '#fff5f5'}; border-radius: 8px;">
-            <span style="font-size: 1.2rem; margin-right: 10px; color: {color};">{icon}</span>
-            <span style="color: #2d3748;">{item}</span>
-        </div>
-        """
-    
-    st.markdown(checklist_html, unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with col3:
-    st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-    st.markdown("###  Current Data Snapshot")
-    
-    # Calculate snapshot data
-    total_patients = df['patient_id'].nunique()
-    clean_patients = df['clean_patient'].sum() if 'clean_patient' in df.columns else 0
-    
-    snapshot_data = [
-        ("Total Sites", df['site_id'].nunique()),
-        ("Total Patients", total_patients),
-        ("Clean Patients", clean_patients),
-        ("Open Queries", int(df['total_queries'].sum())),
-        ("Missing Visits", int(df['missing_visits'].sum())),
-        ("Protocol Deviations", int(df['pds_confirmed'].sum()))
-    ]
-    
-    snapshot_html = ""
-    for label, value in snapshot_data:
-        snapshot_html += f"""
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #e2e8f0;">
-            <span style="color: #4a5568; font-weight: 500;">{label}</span>
-            <span style="color: #1a365d; font-weight: 700; font-size: 1.1rem;">{value:,}</span>
-        </div>
-        """
-    
-    st.markdown(snapshot_html, unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
 
 # =========================
 # 🌍 WORLD MAP (KEEPING ORIGINAL)
@@ -1307,6 +978,580 @@ fig_map.update_layout(
 st.plotly_chart(fig_map, use_container_width=True)
 
 # =========================
+# DATA QUALITY METRICS SECTION
+# =========================
+st.markdown("##  Data Quality Metrics")
+
+# Row 1: Gauge Charts
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.plotly_chart(create_gauge_chart(
+        df['clean_crf_percent'].mean(),
+        "Clean CRF %"
+    ), use_container_width=True)
+
+with col2:
+    st.plotly_chart(create_gauge_chart(
+        df['query_resolution_rate'].mean() if 'query_resolution_rate' in df.columns else 0,
+        "Query Resolution %"
+    ), use_container_width=True)
+
+with col3:
+    st.plotly_chart(create_gauge_chart(
+        100 - df['missing_visits_pct'].mean(),
+        "Visit Completeness %"
+    ), use_container_width=True)
+
+with col4:
+    st.plotly_chart(create_gauge_chart(
+        df['verification_pct'].mean(),
+        "Verification %"
+    ), use_container_width=True)
+
+# =========================
+# ISSUE ANALYSIS SECTION - UPDATED WITH QUERIES DATASET
+# =========================
+st.markdown("## 🔍 Issue Analysis")
+
+tab1, tab2, tab3, tab4 = st.tabs(["Missing Data", "Query Analysis", "Protocol Deviations", "Query Resolution Time"])
+
+with tab1:
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown(dedent("""
+        <div class="chart-container">
+            <h3> Sites with Most Missing Visits</h3>
+        """), unsafe_allow_html=True)
+
+        missing_visits_by_site = (
+            df.groupby('site_id')['missing_visits']
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+        )
+
+        fig = px.bar(
+            x=missing_visits_by_site.index,
+            y=missing_visits_by_site.values,
+            labels={'x': 'Site ID', 'y': 'Missing Visits'},
+            color=missing_visits_by_site.values,
+            color_continuous_scale='Reds'
+        )
+        fig.update_layout(showlegend=False, height=300)
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with col2:
+        st.markdown(dedent("""
+        <div class="chart-container">
+            <h3> Sites with Most Missing Pages</h3>
+        """), unsafe_allow_html=True)
+
+        missing_pages_by_site = (
+            df.groupby('site_id')['missing_pages']
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+        )
+
+        fig = px.bar(
+            x=missing_pages_by_site.index,
+            y=missing_pages_by_site.values,
+            labels={'x': 'Site ID', 'y': 'Missing Pages'},
+            color=missing_pages_by_site.values,
+            color_continuous_scale='Oranges'
+        )
+        fig.update_layout(showlegend=False, height=300)
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+with tab2:
+    if queries_df is not None and not queries_df.empty:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown(dedent("""
+            <div class="chart-container">
+                <h3> Query Status Distribution</h3>
+            """), unsafe_allow_html=True)
+
+            total_open = queries_df['open_queries'].sum() if 'open_queries' in queries_df.columns else 0
+            total_closed = queries_df['closed_queries'].sum() if 'closed_queries' in queries_df.columns else 0
+            
+            status_data = pd.DataFrame({
+                'Status': ['Open', 'Closed'],
+                'Count': [total_open, total_closed]
+            })
+
+            fig = px.pie(
+                status_data,
+                names='Status',
+                values='Count',
+                color='Status',
+                color_discrete_map={'Open': '#e53e3e', 'Closed': '#38a169'},
+                hole=0.4
+            )
+            fig.update_layout(height=350)
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with col2:
+            st.markdown(dedent("""
+            <div class="chart-container">
+                <h3> Top Subjects with Open Queries</h3>
+            """), unsafe_allow_html=True)
+
+            if 'subject_name' in queries_df.columns and 'open_queries' in queries_df.columns:
+                top_open = queries_df.nlargest(10, 'open_queries')[['subject_name', 'open_queries']]
+                
+                fig = px.bar(
+                    top_open,
+                    x='subject_name',
+                    y='open_queries',
+                    labels={'subject_name': 'Subject', 'open_queries': 'Open Queries'},
+                    color='open_queries',
+                    color_continuous_scale='Reds'
+                )
+                fig.update_layout(showlegend=False, height=300, xaxis_tickangle=45)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Subject name or open queries data not available in queries dataset")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.info("No query data available. Please ensure queries.csv is in the data folder.")
+
+with tab3:
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown(dedent("""
+        <div class="chart-container">
+            <h3>⚠️ Protocol Deviations by Site</h3>
+        """), unsafe_allow_html=True)
+
+        pds_by_site = (
+            df.groupby('site_id')['pds_confirmed']
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+        )
+
+        fig = px.bar(
+            x=pds_by_site.index,
+            y=pds_by_site.values,
+            labels={'x': 'Site ID', 'y': 'Confirmed PDs'},
+            color=pds_by_site.values,
+            color_continuous_scale='Reds'
+        )
+        fig.update_layout(showlegend=False, height=300)
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+with tab4:
+    if queries_df is not None and 'avg_resolution_days' in queries_df.columns:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown(dedent("""
+            <div class="chart-container">
+                <h3> Query Resolution Time Distribution</h3>
+            """), unsafe_allow_html=True)
+
+            resolution_data = queries_df[queries_df['avg_resolution_days'].notna()]
+            
+            if not resolution_data.empty:
+                fig = px.histogram(
+                    resolution_data,
+                    x='avg_resolution_days',
+                    labels={'avg_resolution_days': 'Resolution Time (Days)'},
+                    nbins=20,
+                    color_discrete_sequence=['#3182ce']
+                )
+                fig.update_layout(showlegend=False, height=300)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No resolution time data available")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with col2:
+            st.markdown(dedent("""
+            <div class="chart-container">
+                <h3> Resolution Time Statistics</h3>
+            """), unsafe_allow_html=True)
+
+            if not resolution_data.empty:
+                avg_days = resolution_data['avg_resolution_days'].mean()
+                median_days = resolution_data['avg_resolution_days'].median()
+                std_days = resolution_data['avg_resolution_days'].std()
+                min_days = resolution_data['avg_resolution_days'].min()
+                max_days = resolution_data['avg_resolution_days'].max()
+                
+                stats_html = f"""
+                <div style="padding: 20px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                        <span>Average:</span>
+                        <span style="font-weight: bold; color: #3182ce;">{avg_days:.1f} days</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                        <span>Median:</span>
+                        <span style="font-weight: bold; color: #3182ce;">{median_days:.1f} days</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                        <span>Fastest:</span>
+                        <span style="font-weight: bold; color: #38a169;">{min_days:.1f} days</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                        <span>Slowest:</span>
+                        <span style="font-weight: bold; color: #e53e3e;">{max_days:.1f} days</span>
+                    </div>
+                </div>
+                """
+                st.markdown(stats_html, unsafe_allow_html=True)
+            else:
+                st.info("No resolution time statistics available")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.info("No resolution time data available in queries dataset")
+
+# =========================
+# SITE PERFORMANCE HEATMAPS
+# =========================
+st.markdown("##  Site Performance Heatmaps")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.markdown(
+        """
+        <div class="chart-container">
+            <h3>Clean CRF Percentage by Site</h3>
+        """,
+        unsafe_allow_html=True
+    )
+    st.plotly_chart(
+        create_heatmap(df, 'clean_crf_percent', ''),
+        use_container_width=True
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col2:
+    st.markdown(
+        """
+        <div class="chart-container">
+            <h3>✅ Data Readiness Score by Site</h3>
+        """,
+        unsafe_allow_html=True
+    )
+    st.plotly_chart(
+        create_heatmap(df, 'data_readiness_score', ''),
+        use_container_width=True
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================
+# CRITICAL ALERTS SECTION - UPDATED WITH QUERY METRICS
+# =========================
+st.markdown("##  Critical Alerts & Immediate Attention")
+
+# Calculate critical metrics
+site_summary = df.groupby('site_id').agg({
+    'dqi': 'mean',
+    'region': 'first',
+    'missing_visits': 'sum',
+    'missing_pages': 'sum',
+    'pds_confirmed': 'sum',
+    'clean_patient': 'sum',
+    'patient_id': 'nunique'
+}).reset_index()
+
+site_summary['clean_patient_pct'] = (site_summary['clean_patient'] / site_summary['patient_id']) * 100
+
+# Add query metrics if available
+if queries_df is not None:
+    # Note: This is a simplified approach. In a real scenario, you'd need to map subjects to sites
+    # For now, we'll add average query metrics per site
+    site_summary['open_queries'] = total_open_queries / len(site_summary)  # Simplified distribution
+    site_summary['closed_queries'] = total_closed_queries / len(site_summary)  # Simplified distribution
+    site_summary['avg_resolution_days'] = avg_resolution_days  # Same for all sites
+else:
+    site_summary['open_queries'] = 0
+    site_summary['closed_queries'] = 0
+    site_summary['avg_resolution_days'] = 0
+
+# Create a better priority score including query metrics
+def calculate_priority_score(row):
+    score = 0
+    
+    # DQI score (0-100, lower is worse)
+    if row['dqi'] < 20: score += 40
+    elif row['dqi'] < 40: score += 30
+    elif row['dqi'] < 60: score += 20
+    
+    # Clean patient percentage
+    if pd.notna(row['clean_patient_pct']):
+        if row['clean_patient_pct'] < 20: score += 30
+        elif row['clean_patient_pct'] < 50: score += 20
+        elif row['clean_patient_pct'] < 80: score += 10
+    
+    # Open queries
+    if pd.notna(row['open_queries']):
+        if row['open_queries'] > 10: score += 20
+        elif row['open_queries'] > 5: score += 15
+        elif row['open_queries'] > 2: score += 10
+    
+    # Missing visits
+    if pd.notna(row['missing_visits']):
+        if row['missing_visits'] > 20: score += 10
+    
+    # Resolution time
+    if pd.notna(row['avg_resolution_days']):
+        if row['avg_resolution_days'] > 20: score += 15
+        elif row['avg_resolution_days'] > 10: score += 10
+    
+    return score
+
+site_summary['priority_score'] = site_summary.apply(calculate_priority_score, axis=1)
+
+# Categorize priority
+def categorize_priority(score):
+    if score >= 60:
+        return "🔴 Critical", "#feb2b2"
+    elif score >= 40:
+        return "🟠 High", "#fbd38d"
+    elif score >= 20:
+        return "🟡 Medium", "#fefcbf"
+    else:
+        return "🟢 Low", "#c6f6d5"
+
+site_summary['priority_info'] = site_summary['priority_score'].apply(
+    lambda x: categorize_priority(x)
+)
+site_summary['priority'] = site_summary['priority_info'].apply(lambda x: x[0])
+site_summary['priority_color'] = site_summary['priority_info'].apply(lambda x: x[1])
+
+# Determine DQI status
+site_summary['dqi_status'] = site_summary['dqi'].apply(
+    lambda x: ("🔴 Critical", "#e53e3e") if x < 40 else 
+              ("🟠 Warning", "#d69e2e") if x < 60 else 
+              ("🟢 Good", "#38a169")
+)
+site_summary['dqi_status_text'] = site_summary['dqi_status'].apply(lambda x: x[0])
+site_summary['dqi_color'] = site_summary['dqi_status'].apply(lambda x: x[1])
+
+# Top 10 sites needing attention
+critical_sites = site_summary.sort_values(
+    ['priority_score', 'dqi', 'open_queries', 'missing_visits'], 
+    ascending=[False, True, False, False]
+).head(10)
+
+# Display using Streamlit's metric cards
+#st.markdown('<div class="content-card">', unsafe_allow_html=True)
+st.markdown("### ⚠️ Sites Requiring Immediate Attention")
+
+# Create a simpler table view
+show_n = st.selectbox(
+    "Show sites",
+    options=[5, 10, 15, "All"],
+    index=0
+)
+
+if show_n == "All":
+    sites_to_show = critical_sites
+else:
+    sites_to_show = critical_sites.head(show_n)
+
+for _, site in sites_to_show.iterrows():    
+    col1, col2, col3, col4,col5 = st.columns([2, 2, 2, 2,2])
+    
+    with col1:
+        st.metric(
+            label=f"Site {site['site_id']}",
+            value=f"DQI: {site['dqi']:.1f}",
+            delta="Critical" if site['dqi'] < 40 else "Warning" if site['dqi'] < 60 else "Good",
+            delta_color="inverse"
+        )
+    
+    with col2:
+        st.metric(
+        label="Region",
+        value=site['region'],
+        delta_color="off"
+    )
+    with col3:
+        clean_pct = f"{site['clean_patient_pct']:.1f}%" if pd.notna(site['clean_patient_pct']) else "N/A"
+        st.metric(
+            label="Clean Patients",
+            value=clean_pct,
+            delta_color="off")
+        
+    
+    with col4:
+        open_queries_val = int(site['open_queries']) if pd.notna(site['open_queries']) else 0
+        st.metric(
+            label="Open Queries",
+            value=open_queries_val,
+            delta_color="off"
+        )
+    
+    with col5:
+        # Create a colored priority badge
+        priority_text, priority_color = categorize_priority(site['priority_score'])
+        st.markdown(f"""
+        <div style='background-color: {priority_color}; 
+                    padding: 10px; 
+                    border-radius: 8px; 
+                    text-align: center;
+                    font-weight: bold;
+                    color: #2d3748;'>
+            {priority_text}
+        </div>
+        """, unsafe_allow_html=True)
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# =========================
+# DATA READINESS FOR ANALYSIS - UPDATED WITH QUERY METRICS
+# =========================
+st.markdown("##  Data Readiness for Statistical Analysis")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    #st.markdown('<div class="chart-container">', unsafe_allow_html=True)
+    st.markdown("### 🔬 Interim Analysis Readiness")
+    
+    # Calculate readiness score with query metrics
+    try:
+        readiness_score = (
+            (df['clean_crf_percent'].mean() * 0.25) +
+            (100 - df['missing_visits_pct'].mean() * 0.2) +
+            (df['verification_pct'].mean() * 0.2) +
+            (df['signature_pct'].mean() * 0.15) +
+            (df['query_resolution_rate'].mean() * 0.2)  # Increased weight for query resolution
+        )
+    except:
+        readiness_score = 0
+    
+    readiness_level = "✅ Ready" if readiness_score > 80 else "⚠️ Needs Work" if readiness_score > 60 else "❌ Not Ready"
+    readiness_color = "#38a169" if readiness_score > 80 else "#d69e2e" if readiness_score > 60 else "#e53e3e"
+    
+    st.markdown(f"""
+    <div style="text-align: center; padding: 20px;">
+        <div style="font-size: 3rem; font-weight: 800; color: {readiness_color}; margin-bottom: 10px;">
+            {readiness_score:.1f}%
+        </div>
+        <div style="font-size: 1.2rem; color: #4a5568; margin-bottom: 20px;">
+            {readiness_level}
+        </div>
+        <div style="font-size: 0.9rem; color: #718096;">
+            Based on CRF cleanliness, verification, and query resolution
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with col2:
+   # st.markdown('<div class="chart-container">', unsafe_allow_html=True)
+    st.markdown("###  Submission Readiness Checklist")
+    
+    # Define checklist with query metrics
+    checklist_items = []
+    
+    # Check each condition with try-except
+    try:
+        checklist_items.append(("CRF Cleanliness > 85%", df['clean_crf_percent'].mean() > 85))
+    except:
+        checklist_items.append(("CRF Cleanliness > 85%", False))
+    
+    try:
+        checklist_items.append(("Missing Visits < 5%", df['missing_visits_pct'].mean() < 5))
+    except:
+        checklist_items.append(("Missing Visits < 5%", False))
+    
+    try:
+        checklist_items.append(("Verification > 90%", df['verification_pct'].mean() > 90))
+    except:
+        checklist_items.append(("Verification > 90%", False))
+    
+    try:
+        checklist_items.append(("Signatures > 95%", df['signature_pct'].mean() > 95))
+    except:
+        checklist_items.append(("Signatures > 95%", False))
+    
+    try:
+        checklist_items.append(("Query Resolution > 80%", df['query_resolution_rate'].mean() > 80))
+    except:
+        checklist_items.append(("Query Resolution > 80%", False))
+    
+    try:
+        checklist_items.append(("Avg Resolution Time < 10 days", avg_resolution_days < 10))
+    except:
+        checklist_items.append(("Avg Resolution Time < 10 days", False))
+    
+    try:
+        checklist_items.append(("PDs Resolved", df['pds_confirmed'].mean() > 0))
+    except:
+        checklist_items.append(("PDs Resolved", False))
+    
+    checklist_html = ""
+    for item, status in checklist_items:
+        icon = "✅" if status else "❌"
+        color = "#38a169" if status else "#e53e3e"
+        checklist_html += f"""
+        <div style="display: flex; align-items: center; margin-bottom: 10px; padding: 8px; background-color: {'#f0fff4' if status else '#fff5f5'}; border-radius: 8px;">
+            <span style="font-size: 1.2rem; margin-right: 10px; color: {color};">{icon}</span>
+            <span style="color: #2d3748;">{item}</span>
+        </div>
+        """
+    
+    st.markdown(checklist_html, unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with col3:
+   # st.markdown('<div class="chart-container">', unsafe_allow_html=True)
+    st.markdown("###  Current Data Snapshot")
+    
+    # Calculate snapshot data including query metrics
+    total_patients = df['patient_id'].nunique()
+    clean_patients = df['clean_patient'].sum() if 'clean_patient' in df.columns else 0
+    
+    snapshot_data = [
+        ("Total Sites", df['site_id'].nunique()),
+        ("Total Patients", total_patients),
+        ("Clean Patients", clean_patients),
+        ("Open Queries", int(total_open_queries)),
+        ("Closed Queries", int(total_closed_queries)),
+        ("Avg Resolution Time", f"{avg_resolution_days:.1f} days"),
+        ("Missing Visits", int(df['missing_visits'].sum())),
+        ("Protocol Deviations", int(df['pds_confirmed'].sum()))
+    ]
+    
+    snapshot_html = ""
+    for label, value in snapshot_data:
+        snapshot_html += f"""
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #e2e8f0;">
+            <span style="color: #4a5568; font-weight: 500;">{label}</span>
+            <span style="color: #1a365d; font-weight: 700; font-size: 1.1rem;">{value}</span>
+        </div>
+        """
+    
+    st.markdown(snapshot_html, unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# =========================
 #  AI TOOLS SECTION (KEEPING ORIGINAL)
 # =========================
 st.markdown("## AI Tools")
@@ -1345,11 +1590,11 @@ with ai_tab1:
                 
                 placeholder.empty()
                 
-                # Display results (keeping original content)
+                # Display results
                 st.markdown('<div class="content-card">', unsafe_allow_html=True)
                 st.markdown("##  Executive Summary")
                 
-                if "narrative" in result:
+                if isinstance(result, dict) and "narrative" in result:
                     narrative = result["narrative"]
                     if "SECTION A" in narrative and "SECTION B" in narrative:
                         sections = narrative.split("SECTION B")
@@ -1368,6 +1613,387 @@ with ai_tab1:
                         st.write(narrative)
                 st.markdown('</div>', unsafe_allow_html=True)
                 
+                # =====================================================
+                # 📊 CONFIDENCE METER & RISK FINGERPRINT
+                # =====================================================
+                if isinstance(result, dict) and "metrics" in result:
+                    metrics = result["metrics"]
+                    
+                    # ---- Confidence Meter ----
+                    if "confidence_score" in metrics:
+                        st.markdown('<div class="content-card">', unsafe_allow_html=True)
+                        st.markdown("### 📊 Data Readiness Confidence")
+                        confidence = metrics["confidence_score"]
+                        
+                        # Color code based on confidence
+                        if confidence >= 70:
+                            color = "green"
+                        elif confidence >= 40:
+                            color = "orange"
+                        else:
+                            color = "red"
+                        
+                        st.markdown(f"""
+                        <div style="background-color:#f8f9fa; padding:15px; border-radius:10px; border-left:5px solid {color}; border: 1px solid #e2e8f0;">
+                            <h4 style="margin:0; color:#2d3748;">Confidence Score: <span style="color:{color}; font-weight:bold;">{confidence}%</span></h4>
+                            <div style="width:100%; background-color:#e2e8f0; border-radius:5px; margin-top:10px;">
+                                <div style="width:{confidence}%; background-color:{color}; height:20px; border-radius:5px;"></div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Interpretation
+                        if confidence < 40:
+                            st.warning("⚠️ Low confidence score indicates need for manual validation and deeper analysis.")
+                        elif confidence < 70:
+                            st.info("ℹ️ Moderate confidence score - some areas may need attention.")
+                        else:
+                            st.success("✅ High confidence score - data is reliable for analysis.")
+                        
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    # ---- Risk Fingerprint ----
+                    if "risk_fingerprint" in metrics and metrics["risk_fingerprint"]:
+                        st.markdown('<div class="content-card">', unsafe_allow_html=True)
+                        st.markdown("### 🔎 Risk Fingerprint (Top Sites)")
+                        rf_df = pd.DataFrame(metrics["risk_fingerprint"])
+                        
+                        if not rf_df.empty and "site_id" in rf_df.columns:
+                            # Create a formatted table
+                            display_df = rf_df.copy()
+                            
+                            # Add risk indicators
+                            if "low_dqi" in display_df.columns:
+                                display_df["DQI Status"] = display_df["low_dqi"].apply(
+                                    lambda x: "🔴 Critical" if x else "🟢 Good"
+                                )
+                            
+                            if "high_load" in display_df.columns:
+                                display_df["Load Status"] = display_df["high_load"].apply(
+                                    lambda x: "🔴 High" if x else "🟢 Normal"
+                                )
+                            
+                            # Select and rename columns for display
+                            display_cols = ["site_id"]
+                            rename_map = {"site_id": "Site ID"}
+                            
+                            if "DQI Status" in display_df.columns:
+                                display_cols.append("DQI Status")
+                                rename_map["DQI Status"] = "DQI Status"
+                            
+                            if "Load Status" in display_df.columns:
+                                display_cols.append("Load Status")
+                                rename_map["Load Status"] = "Load Status"
+                            
+                            if "severity" in display_df.columns:
+                                display_cols.append("severity")
+                                rename_map["severity"] = "Severity Score"
+                            
+                            # Display table with custom styling
+                            st.dataframe(
+                                display_df[display_cols].rename(columns=rename_map),
+                                use_container_width=True,
+                                height=250
+                            )
+                        
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    # ---- Action Priority Stack ----
+                    if "action_stack" in metrics and metrics["action_stack"]:
+                        st.markdown('<div class="content-card">', unsafe_allow_html=True)
+                        st.markdown("### 🚨 Action Priority (Next 7 Days)")
+                        
+                        for i, item in enumerate(metrics["action_stack"][:5], start=1):  # Show top 5
+                            if isinstance(item, dict):
+                                # Create a card for each action item
+                                with st.container():
+                                    cols = st.columns([1, 4])
+                                    with cols[0]:
+                                        st.markdown(f"<h3 style='text-align: center; color: #4299e1;'>#{i}</h3>", unsafe_allow_html=True)
+                                    with cols[1]:
+                                        details = []
+                                        if "site_id" in item:
+                                            details.append(f"**Site:** {item['site_id']}")
+                                        if "avg_dqi" in item:
+                                            # Color code DQI
+                                            dqi = item['avg_dqi']
+                                            color = "#e53e3e" if dqi < 40 else "#d69e2e" if dqi < 60 else "#38a169"
+                                            details.append(f"**DQI:** <span style='color:{color}; font-weight:bold;'>{dqi:.1f}</span>")
+                                        if "patients" in item:
+                                            details.append(f"**Patients:** {item['patients']}")
+                                        if "severity" in item:
+                                            # Color code severity
+                                            severity = item['severity']
+                                            severity_color = "#e53e3e" if severity > 7 else "#d69e2e" if severity > 4 else "#38a169"
+                                            details.append(f"**Severity:** <span style='color:{severity_color}; font-weight:bold;'>{severity:.1f}/10</span>")
+                                        
+                                        st.markdown(" • ".join(details), unsafe_allow_html=True)
+                                        
+                                        # Action description if available
+                                        if "action" in item:
+                                            st.markdown(f"**Action:** {item['action']}")
+                                        
+                                    st.markdown("---")
+                        
+                        st.markdown('</div>', unsafe_allow_html=True)
+                
+                # =====================================================
+                # 📋 OVERALL SITE PERFORMANCE SUMMARY
+                # =====================================================
+                st.markdown('<div class="content-card">', unsafe_allow_html=True)
+                st.markdown("## 📋 Overall Site Performance Summary")
+                
+                # Check if required columns exist
+                required_cols = ["site_id", "patient_id", "dqi"]
+                missing_cols = [col for col in required_cols if col not in drill_df.columns]
+                
+                if missing_cols:
+                    st.warning(f"Missing columns: {missing_cols}. Cannot generate site performance summary.")
+                else:
+                    # Group by site
+                    agg_dict = {
+                        "total_subjects": ("patient_id", "nunique"),
+                        "avg_dqi": ("dqi", "mean"),
+                    }
+                    
+                    # Add subject_status if it exists
+                    if "subject_status" in drill_df.columns:
+                        agg_dict["active_subjects"] = ("subject_status", lambda x: (x == "On Trial").sum())
+                        agg_dict["screen_failures"] = ("subject_status", lambda x: (x == "Screen Failure").sum())
+                    
+                    site_perf = (
+                        drill_df.groupby("site_id")
+                        .agg(**agg_dict)
+                        .reset_index()
+                        .round(1)
+                    )
+                    
+                    # Function to determine observation
+                    def site_observation(row):
+                        if row["avg_dqi"] < 40:
+                            return "🔴 Critical DQI Risk"
+                        elif "screen_failures" in row and row["screen_failures"] > row["total_subjects"] / 2:
+                            return "🟠 High Screen Failure Rate"
+                        elif row["avg_dqi"] < 60:
+                            return "🟡 Needs Attention"
+                        else:
+                            return "🟢 Good Performance"
+                    
+                    site_perf["Status"] = site_perf.apply(site_observation, axis=1)
+                    
+                    # Rename columns
+                    rename_dict = {
+                        "site_id": "Site ID",
+                        "total_subjects": "Total Subjects",
+                        "avg_dqi": "Avg DQI",
+                        "Status": "Status"
+                    }
+                    
+                    if "active_subjects" in site_perf.columns:
+                        rename_dict["active_subjects"] = "Active Subjects"
+                    if "screen_failures" in site_perf.columns:
+                        rename_dict["screen_failures"] = "Screen Failures"
+                    
+                    site_perf = site_perf.rename(columns=rename_dict)
+                    
+                    # Display with sorting by DQI (worst first)
+                    display_df = site_perf.sort_values("Avg DQI", ascending=True).head(20)
+                    
+                    # Apply color formatting
+                    def color_dqi(val):
+                        if val < 40:
+                            color = "#e53e3e"
+                        elif val < 60:
+                            color = "#d69e2e"
+                        elif val < 85:
+                            color = "#d69e2e"
+                        else:
+                            color = "#38a169"
+                        return f"color: {color}; font-weight: bold"
+                    
+                    # Apply styling
+                    styled_df = display_df.style.apply(lambda x: ['background-color: #f7fafc' if i % 2 == 0 else '' for i in range(len(x))], axis=0)
+                    
+                    # Display
+                    st.dataframe(
+                        styled_df,
+                        use_container_width=True,
+                        height=350
+                    )
+                    
+                    # Summary stats
+                    st.markdown("### 📈 Performance Summary")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("Total Sites", len(site_perf))
+                    
+                    with col2:
+                        critical_sites = len(site_perf[site_perf["Avg DQI"] < 60])
+                        st.metric("Sites Needing Attention", critical_sites)
+                    
+                    with col3:
+                        avg_dqi = site_perf["Avg DQI"].mean()
+                        st.metric("Average DQI", f"{avg_dqi:.1f}")
+                    
+                    with col4:
+                        if "Active Subjects" in site_perf.columns:
+                            active_total = site_perf["Active Subjects"].sum()
+                            st.metric("Active Subjects", active_total)
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+                # =====================================================
+                # 📊 COMPOSITION PIE CHARTS
+                # =====================================================
+                st.markdown('<div class="content-card">', unsafe_allow_html=True)
+                st.markdown("## 📊 Composition Overview")
+                
+                c1, c2 = st.columns(2)
+                
+                # ---- Subject Status Pie ----
+                with c1:
+                    # Check for different possible column names
+                    status_col = None
+                    for col in drill_df.columns:
+                        if "status" in col.lower() and "subject" in col.lower():
+                            status_col = col
+                            break
+                    
+                    if status_col:
+                        status_counts = drill_df[status_col].value_counts().reset_index()
+                        status_counts.columns = ["Status", "Count"]
+                        
+                        fig_status = px.pie(
+                            status_counts,
+                            names="Status",
+                            values="Count",
+                            hole=0.45,
+                            title="Subject Status Distribution",
+                            color_discrete_sequence=px.colors.qualitative.Set3
+                        )
+                        fig_status.update_layout(
+                            height=350,
+                            paper_bgcolor='white',
+                            plot_bgcolor='white',
+                            font=dict(color="#2d3748")
+                        )
+                        st.plotly_chart(fig_status, use_container_width=True)
+                    else:
+                        st.info("Subject status data not available")
+                
+                # ---- DQI Band Pie ----
+                with c2:
+                    if "dqi" in drill_df.columns:
+                        dqi_bins = pd.cut(
+                            drill_df["dqi"],
+                            bins=[0, 40, 60, 85, 100],
+                            labels=[
+                                "Critical (<40)",
+                                "At Risk (40–59)",
+                                "Acceptable (60–84)",
+                                "High Quality (85+)"
+                            ]
+                        )
+                        dqi_dist = dqi_bins.value_counts().reset_index()
+                        dqi_dist.columns = ["DQI Band", "Count"]
+                        
+                        color_map = {
+                            "Critical (<40)": "#e53e3e",
+                            "At Risk (40–59)": "#d69e2e",
+                            "Acceptable (60–84)": "#4299e1",
+                            "High Quality (85+)": "#38a169"
+                        }
+                        
+                        fig_dqi = px.pie(
+                            dqi_dist,
+                            names="DQI Band",
+                            values="Count",
+                            hole=0.45,
+                            title="DQI Quality Breakdown",
+                            color="DQI Band",
+                            color_discrete_map=color_map
+                        )
+                        fig_dqi.update_layout(
+                            height=350,
+                            paper_bgcolor='white',
+                            plot_bgcolor='white',
+                            font=dict(color="#2d3748")
+                        )
+                        st.plotly_chart(fig_dqi, use_container_width=True)
+                    else:
+                        st.info("DQI data not available")
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+                # =====================================================
+                # ⬇ DOWNLOAD OPTIONS
+                # =====================================================
+                if 'site_perf' in locals():
+                    st.markdown('<div class="content-card">', unsafe_allow_html=True)
+                    st.markdown("## ⬇ Download Options")
+                    
+                    # Prepare data for download
+                    csv_data = site_perf.to_csv(index=False)
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.download_button(
+                            "📥 Download Site Performance (CSV)",
+                            csv_data,
+                            "site_performance_summary.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                    
+                    with col2:
+                        # Create a summary report
+                        report_text = f"""CLINICAL TRIAL SITE PERFORMANCE REPORT
+Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
+
+============================================
+
+OVERALL SUMMARY
+---------------
+Total Sites: {len(site_perf)}
+Total Subjects: {site_perf['Total Subjects'].sum():,}
+Average DQI: {site_perf['Avg DQI'].mean():.1f}
+Sites Needing Attention (DQI < 60): {len(site_perf[site_perf['Avg DQI'] < 60])}
+
+TOP 10 SITES NEEDING ATTENTION
+------------------------------
+{site_perf.sort_values('Avg DQI').head(10).to_string(index=False)}
+
+AI EXECUTIVE INSIGHTS
+---------------------
+{result.get('narrative', 'No narrative available')[:500]}...
+
+DATA QUALITY CONFIDENCE
+-----------------------
+Confidence Score: {metrics.get('confidence_score', 'N/A') if isinstance(result, dict) and 'metrics' in result else 'N/A'}%
+
+RISK FINGERPRINT SITES
+----------------------
+{rf_df.to_string(index=False) if 'rf_df' in locals() and not rf_df.empty else 'No risk sites identified'}
+
+ACTION PRIORITIES
+-----------------
+{chr(10).join([f"{i+1}. Site {item.get('site_id', 'N/A')} - DQI: {item.get('avg_dqi', 'N/A'):.1f}" for i, item in enumerate(metrics.get('action_stack', [])[:3])]) if isinstance(result, dict) and 'metrics' in result else 'No action priorities'}
+
+============================================
+Report generated by Clinical Data Quality Dashboard
+"""
+                        st.download_button(
+                            "📥 Download Executive Report (TXT)",
+                            report_text,
+                            "clinical_site_summary.txt",
+                            mime="text/plain",
+                            use_container_width=True
+                        )
+                    
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
             except Exception as e:
                 st.error(f"❌ Error generating site summary: {str(e)}")
                 import traceback
@@ -1375,7 +2001,6 @@ with ai_tab1:
                     st.code(traceback.format_exc())
         else:
             st.info("Click the button above to generate a comprehensive site summary analysis.")
-
 # Tab 2: Agent Recommendations (keeping original)
 with ai_tab2:
     st.markdown("### AI Agent Recommendations")
